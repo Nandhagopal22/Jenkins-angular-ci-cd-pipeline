@@ -1,402 +1,232 @@
-# ========================================
-# Azure Infrastructure Automation Toolkit
-# Windows PowerShell DevOps Scripts
-# Author: Nandhagopal M
-# ========================================
-
-# PROJECT STRUCTURE:
-# azure-devops-automation/
-# ├── README.md
-# ├── scripts/
-# │   ├── 01-setup-environment.ps1
-# │   ├── 02-provision-infrastructure.ps1
-# │   ├── 03-deploy-application.ps1
-# │   ├── 04-monitoring-setup.ps1
-# │   └── 05-cleanup-resources.ps1
-# ├── terraform/
-# │   ├── main.tf
-# │   ├── variables.tf
-# │   └── outputs.tf
-# └── config/
-#     └── config.json
-
-# ========================================
-# SCRIPT 1: Setup Environment
-# File: scripts/01-setup-environment.ps1
-# ========================================
-
-<#
-.SYNOPSIS
-    Automated Azure environment setup and validation
-
-.DESCRIPTION
-    This script configures Azure CLI, validates credentials,
-    and prepares the environment for infrastructure deployment
-
-.EXAMPLE
-    .\01-setup-environment.ps1 -SubscriptionId "your-subscription-id"
-#>
-
-param(
-    [Parameter(Mandatory=$true)]
-    [string]$SubscriptionId,
-    
-    [Parameter(Mandatory=$false)]
-    [string]$Location = "East US"
-)
-
-# Enable strict mode for better error handling
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
-Write-Host "=== Azure DevOps Environment Setup ===" -ForegroundColor Cyan
-
-# Check if Azure CLI is installed
-Write-Host "`n[1/5] Checking Azure CLI installation..." -ForegroundColor Yellow
-try {
-    $azVersion = az --version
-    Write-Host "✓ Azure CLI is installed" -ForegroundColor Green
-} catch {
-    Write-Host "✗ Azure CLI not found. Please install from: https://aka.ms/installazurecliwindows" -ForegroundColor Red
-    exit 1
-}
-
-# Login to Azure
-Write-Host "`n[2/5] Logging into Azure..." -ForegroundColor Yellow
-try {
-    az login --use-device-code
-    Write-Host "✓ Successfully logged in" -ForegroundColor Green
-} catch {
-    Write-Host "✗ Azure login failed" -ForegroundColor Red
-    exit 1
-}
-
-# Set active subscription
-Write-Host "`n[3/5] Setting active subscription..." -ForegroundColor Yellow
-az account set --subscription $SubscriptionId
-$currentSub = az account show --query name -o tsv
-Write-Host "✓ Active subscription: $currentSub" -ForegroundColor Green
-
-# Create service principal for automation
-Write-Host "`n[4/5] Creating service principal..." -ForegroundColor Yellow
-$spName = "devops-automation-sp-$(Get-Date -Format 'yyyyMMdd')"
-$sp = az ad sp create-for-rbac --name $spName --role Contributor --scopes "/subscriptions/$SubscriptionId" | ConvertFrom-Json
-
-Write-Host "✓ Service Principal created" -ForegroundColor Green
-Write-Host "  Client ID: $($sp.appId)" -ForegroundColor White
-Write-Host "  Save these credentials securely!" -ForegroundColor Yellow
-
-# Save configuration
-Write-Host "`n[5/5] Saving configuration..." -ForegroundColor Yellow
-$config = @{
-    subscription_id = $SubscriptionId
-    location = $Location
-    sp_client_id = $sp.appId
-    created_date = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-}
-
-$configPath = "../config/config.json"
-$config | ConvertTo-Json | Out-File -FilePath $configPath -Encoding UTF8
-Write-Host "✓ Configuration saved to $configPath" -ForegroundColor Green
-
-Write-Host "`n=== Setup Complete! ===" -ForegroundColor Cyan
-Write-Host "You can now proceed with infrastructure provisioning.`n" -ForegroundColor White
-
-
-# ========================================
-# SCRIPT 2: Provision Infrastructure
-# File: scripts/02-provision-infrastructure.ps1
-# ========================================
-
-<#
-.SYNOPSIS
-    Automated Azure infrastructure provisioning using Terraform
-
-.DESCRIPTION
-    Deploys a complete 3-tier infrastructure including VNet,
-    Subnets, NSGs, VMs, and monitoring
-
-.EXAMPLE
-    .\02-provision-infrastructure.ps1 -Environment "dev"
-#>
-
-param(
-    [Parameter(Mandatory=$true)]
-    [ValidateSet("dev", "staging", "prod")]
-    [string]$Environment,
-    
-    [Parameter(Mandatory=$false)]
-    [switch]$AutoApprove
-)
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
-Write-Host "=== Azure Infrastructure Provisioning ===" -ForegroundColor Cyan
-Write-Host "Environment: $Environment`n" -ForegroundColor Yellow
-
-# Load configuration
-$config = Get-Content "../config/config.json" | ConvertFrom-Json
-
-# Resource naming convention
-$resourcePrefix = "devops-$Environment"
-$resourceGroupName = "$resourcePrefix-rg"
-$location = $config.location
-
-# Create resource group
-Write-Host "[1/6] Creating resource group..." -ForegroundColor Yellow
-az group create --name $resourceGroupName --location $location | Out-Null
-Write-Host "✓ Resource group created: $resourceGroupName" -ForegroundColor Green
-
-# Create Virtual Network
-Write-Host "`n[2/6] Creating virtual network..." -ForegroundColor Yellow
-$vnetName = "$resourcePrefix-vnet"
-az network vnet create `
-    --resource-group $resourceGroupName `
-    --name $vnetName `
-    --address-prefix "10.0.0.0/16" `
-    --subnet-name "web-subnet" `
-    --subnet-prefix "10.0.1.0/24" | Out-Null
-Write-Host "✓ VNet created: $vnetName" -ForegroundColor Green
-
-# Create additional subnets
-Write-Host "`n[3/6] Creating application subnets..." -ForegroundColor Yellow
-az network vnet subnet create `
-    --resource-group $resourceGroupName `
-    --vnet-name $vnetName `
-    --name "app-subnet" `
-    --address-prefix "10.0.2.0/24" | Out-Null
-
-az network vnet subnet create `
-    --resource-group $resourceGroupName `
-    --vnet-name $vnetName `
-    --name "db-subnet" `
-    --address-prefix "10.0.3.0/24" | Out-Null
-Write-Host "✓ Subnets created" -ForegroundColor Green
-
-# Create Network Security Group
-Write-Host "`n[4/6] Creating network security group..." -ForegroundColor Yellow
-$nsgName = "$resourcePrefix-nsg"
-az network nsg create `
-    --resource-group $resourceGroupName `
-    --name $nsgName | Out-Null
-
-# Add NSG rules
-az network nsg rule create `
-    --resource-group $resourceGroupName `
-    --nsg-name $nsgName `
-    --name "AllowHTTP" `
-    --priority 100 `
-    --direction Inbound `
-    --access Allow `
-    --protocol Tcp `
-    --destination-port-ranges 80 | Out-Null
-
-az network nsg rule create `
-    --resource-group $resourceGroupName `
-    --nsg-name $nsgName `
-    --name "AllowHTTPS" `
-    --priority 110 `
-    --direction Inbound `
-    --access Allow `
-    --protocol Tcp `
-    --destination-port-ranges 443 | Out-Null
-
-Write-Host "✓ NSG created with security rules" -ForegroundColor Green
-
-# Create Storage Account
-Write-Host "`n[5/6] Creating storage account..." -ForegroundColor Yellow
-$storageAccountName = "devops$Environment$(Get-Random -Maximum 9999)"
-az storage account create `
-    --resource-group $resourceGroupName `
-    --name $storageAccountName `
-    --sku Standard_LRS `
-    --location $location | Out-Null
-Write-Host "✓ Storage account created: $storageAccountName" -ForegroundColor Green
-
-# Create Log Analytics Workspace
-Write-Host "`n[6/6] Creating Log Analytics workspace..." -ForegroundColor Yellow
-$workspaceName = "$resourcePrefix-logs"
-az monitor log-analytics workspace create `
-    --resource-group $resourceGroupName `
-    --workspace-name $workspaceName `
-    --location $location | Out-Null
-Write-Host "✓ Log Analytics workspace created" -ForegroundColor Green
-
-# Generate deployment report
-Write-Host "`n=== Deployment Summary ===" -ForegroundColor Cyan
-Write-Host "Resource Group: $resourceGroupName" -ForegroundColor White
-Write-Host "Virtual Network: $vnetName (10.0.0.0/16)" -ForegroundColor White
-Write-Host "Subnets: web-subnet, app-subnet, db-subnet" -ForegroundColor White
-Write-Host "NSG: $nsgName" -ForegroundColor White
-Write-Host "Storage: $storageAccountName" -ForegroundColor White
-Write-Host "Monitoring: $workspaceName" -ForegroundColor White
-
-# Save deployment info
-$deploymentInfo = @{
-    environment = $Environment
-    resource_group = $resourceGroupName
-    vnet_name = $vnetName
-    storage_account = $storageAccountName
-    workspace_name = $workspaceName
-    deployed_at = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-}
-
-$deploymentInfo | ConvertTo-Json | Out-File -FilePath "../config/deployment-$Environment.json" -Encoding UTF8
-Write-Host "`n✓ Deployment info saved" -ForegroundColor Green
-
-
-# ========================================
-# SCRIPT 3: Health Check & Monitoring
-# File: scripts/04-monitoring-setup.ps1
-# ========================================
-
-<#
-.SYNOPSIS
-    Automated infrastructure health checks and monitoring setup
-
-.DESCRIPTION
-    Validates deployed resources, configures alerts,
-    and generates health report
-
-.EXAMPLE
-    .\04-monitoring-setup.ps1 -Environment "dev"
-#>
-
-param(
-    [Parameter(Mandatory=$true)]
-    [string]$Environment
-)
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
-Write-Host "=== Infrastructure Health Check ===" -ForegroundColor Cyan
-
-# Load deployment info
-$deploymentFile = "../config/deployment-$Environment.json"
-if (-not (Test-Path $deploymentFile)) {
-    Write-Host "✗ Deployment file not found. Run provisioning first." -ForegroundColor Red
-    exit 1
-}
-
-$deployment = Get-Content $deploymentFile | ConvertFrom-Json
-$resourceGroup = $deployment.resource_group
-
-Write-Host "`nChecking resources in: $resourceGroup`n" -ForegroundColor Yellow
-
-# Check Resource Group
-Write-Host "[1/5] Checking resource group..." -ForegroundColor Yellow
-$rgStatus = az group exists --name $resourceGroup
-if ($rgStatus -eq "true") {
-    Write-Host "✓ Resource group exists" -ForegroundColor Green
-} else {
-    Write-Host "✗ Resource group not found" -ForegroundColor Red
-}
-
-# Check VNet
-Write-Host "`n[2/5] Checking virtual network..." -ForegroundColor Yellow
-$vnetInfo = az network vnet show --resource-group $resourceGroup --name $deployment.vnet_name 2>$null
-if ($vnetInfo) {
-    $vnet = $vnetInfo | ConvertFrom-Json
-    Write-Host "✓ VNet is healthy" -ForegroundColor Green
-    Write-Host "  Address Space: $($vnet.addressSpace.addressPrefixes -join ', ')" -ForegroundColor White
-    Write-Host "  Subnets: $($vnet.subnets.Count)" -ForegroundColor White
-} else {
-    Write-Host "✗ VNet not found" -ForegroundColor Red
-}
-
-# Check Storage Account
-Write-Host "`n[3/5] Checking storage account..." -ForegroundColor Yellow
-$storageInfo = az storage account show --name $deployment.storage_account --resource-group $resourceGroup 2>$null
-if ($storageInfo) {
-    $storage = $storageInfo | ConvertFrom-Json
-    Write-Host "✓ Storage account is healthy" -ForegroundColor Green
-    Write-Host "  Status: $($storage.statusOfPrimary)" -ForegroundColor White
-    Write-Host "  SKU: $($storage.sku.name)" -ForegroundColor White
-} else {
-    Write-Host "✗ Storage account not found" -ForegroundColor Red
-}
-
-# Check Log Analytics
-Write-Host "`n[4/5] Checking Log Analytics workspace..." -ForegroundColor Yellow
-$workspaceInfo = az monitor log-analytics workspace show --resource-group $resourceGroup --workspace-name $deployment.workspace_name 2>$null
-if ($workspaceInfo) {
-    Write-Host "✓ Log Analytics workspace is healthy" -ForegroundColor Green
-} else {
-    Write-Host "✗ Log Analytics workspace not found" -ForegroundColor Red
-}
-
-# Resource count summary
-Write-Host "`n[5/5] Generating resource summary..." -ForegroundColor Yellow
-$allResources = az resource list --resource-group $resourceGroup | ConvertFrom-Json
-$resourceTypes = $allResources | Group-Object type | Select-Object Name, Count
-
-Write-Host "`n=== Resource Summary ===" -ForegroundColor Cyan
-foreach ($type in $resourceTypes) {
-    Write-Host "  $($type.Name): $($type.Count)" -ForegroundColor White
-}
-
-# Generate health report
-$healthReport = @{
-    environment = $Environment
-    resource_group = $resourceGroup
-    total_resources = $allResources.Count
-    check_time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    status = "Healthy"
-}
-
-$reportPath = "../reports/health-check-$Environment-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
-New-Item -ItemType Directory -Force -Path "../reports" | Out-Null
-$healthReport | ConvertTo-Json | Out-File -FilePath $reportPath -Encoding UTF8
-
-Write-Host "`n✓ Health report saved to: $reportPath" -ForegroundColor Green
-Write-Host "`n=== Health Check Complete ===" -ForegroundColor Cyan
-
-
-# ========================================
-# SCRIPT 5: Cleanup Resources
-# File: scripts/05-cleanup-resources.ps1
-# ========================================
-
-<#
-.SYNOPSIS
-    Automated infrastructure cleanup
-
-.DESCRIPTION
-    Safely removes all deployed Azure resources
-
-.EXAMPLE
-    .\05-cleanup-resources.ps1 -Environment "dev" -Confirm
-#>
-
-param(
-    [Parameter(Mandatory=$true)]
-    [string]$Environment,
-    
-    [Parameter(Mandatory=$false)]
-    [switch]$Confirm
-)
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
-$resourceGroup = "devops-$Environment-rg"
-
-Write-Host "=== Resource Cleanup ===" -ForegroundColor Red
-Write-Host "Environment: $Environment" -ForegroundColor Yellow
-Write-Host "Resource Group: $resourceGroup`n" -ForegroundColor Yellow
-
-if (-not $Confirm) {
-    $response = Read-Host "Are you sure you want to delete all resources? (yes/no)"
-    if ($response -ne "yes") {
-        Write-Host "Cleanup cancelled." -ForegroundColor Yellow
-        exit 0
+pipeline {
+    agent any
+
+    environment {
+        GITHUB_URL = ''
+        Files_To_Keep = 30
+        Version = "V1.0.0.1"
+        BUILD_NUMBER = "${BUILD_NUMBER}"
+        SERVICE_PATHS = "WEB.LABV1/DEV.WEBAPP/, "
+        SHARED_PATHS = "Jenkinsfile"
+    }
+//test
+    stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    // Initialize inline functions
+                    sharedFunctions = [
+                        hasServiceChanges: { servicePaths, sharedPaths = [] ->
+                            try {
+                                def changesText = ""
+                                
+                                if (env.GIT_PREVIOUS_COMMIT && env.GIT_PREVIOUS_COMMIT != env.GIT_COMMIT) {
+                                    changesText = bat(
+                                        script: "@git diff --name-only ${env.GIT_PREVIOUS_COMMIT} ${env.GIT_COMMIT}",
+                                        returnStdout: true
+                                    ).trim()
+                                } else {
+                                    changesText = bat(
+                                        script: "@git diff-tree --no-commit-id --name-only -r ${env.GIT_COMMIT}",
+                                        returnStdout: true
+                                    ).trim()
+                                }
+                                
+                                if (!changesText) {
+                                    echo "No changes found"
+                                    return false
+                                }
+                                
+                                def changes = changesText.split('\n').findAll { it?.trim() }
+                                
+                                echo "Changed files (${changes.size()}):"
+                                changes.each { echo "  - ${it}" }
+                                
+                                // Check service paths
+                                def serviceChanged = changes.any { file ->
+                                    servicePaths.any { path ->
+                                        file.replace('\\', '/').startsWith(path.replace('\\', '/'))
+                                    }
+                                }
+                                
+                                if (serviceChanged) {
+                                    echo "✅ Changes in service paths"
+                                    return true
+                                }
+                                
+                                // Check shared paths
+                                if (sharedPaths) {
+                                    def sharedChanged = changes.any { file ->
+                                        sharedPaths.any { path ->
+                                            file.replace('\\', '/').startsWith(path.replace('\\', '/'))
+                                        }
+                                    }
+                                    
+                                    if (sharedChanged) {
+                                        echo "✅ Changes in shared paths"
+                                        return true
+                                    }
+                                }
+                                
+                                echo "❌ No changes detected"
+                                return false
+                                
+                            } catch (Exception e) {
+                                echo "⚠️ Error: ${e.message}"
+                                return true
+                            }
+                        },
+                        
+                        skipBuildGracefully: { reason ->
+                            echo "⏭️ SKIPPING: ${reason}"
+                            currentBuild.result = 'NOT_BUILT'
+                            currentBuild.description = "⏭️ Skipped: ${reason}"
+                            error("Build skipped - ${reason}")
+                        }
+                    ]
+                    
+                    echo "✅ Functions initialized"
+                }
+            }
+        }
+        stage('Branch Configuration') {
+            steps {
+                script {
+                    echo "Detected Branch: ${env.BRANCH_NAME}"
+
+                    switch (env.BRANCH_NAME) {
+                        case '':
+                            env.PIPELINE_STAGE = 
+                            env.uiProjectName = 
+                            env.ReleaseFolder = 
+                            env.ReleaseFileName = 
+                            env.scriptPath = 
+                            break
+
+                        case 'Development':
+                            env.PIPELINE_STAGE = 'uat'
+                            env.uiProjectName = 
+                            env.ReleaseFolder = 
+                            env.ReleaseFileName = 
+                            env.scriptPath = 
+                            break
+
+                        case '':
+                            env.PIPELINE_STAGE = 'uat'
+                            env.uiProjectName = 
+                            env.ReleaseFolder = 
+                            env.ReleaseFileName = 
+                            env.scriptPath = 
+                            break
+                        
+                        case '':
+                            env.PIPELINE_STAGE = 
+                            env.uiProjectName = 
+                            env.ReleaseFolder = 
+                            env.ReleaseFileName = 
+                            env.scriptPath = 
+                            break
+
+                        default:
+                            error "❌ Unsupported branch: ${env.BRANCH_NAME}"
+                    }
+
+                    echo "Using script: ${env.scriptPath}"
+                    echo "Release folder: ${env.ReleaseFolder}"
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+                echo "✅ Checked out ${env.BRANCH_NAME}"
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                powershell """
+                    Write-Host "Installing dependencies for: ${env.uiProjectName}"
+                    Set-Location "${env.uiProjectName}"
+                    npm install --force --save
+                    if (\$LASTEXITCODE -ne 0) {
+                        Write-Host "❌ NPM install failed"
+                        exit \$LASTEXITCODE
+                    }
+                """
+            }
+        }
+
+        stage('Build Application') {
+            steps {
+                bat """
+                    echo Building project: %uiProjectName%
+                    cd %uiProjectName%
+                    npm run build:%PIPELINE_STAGE%
+                    if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+                """
+            }
+        }
+
+        stage('Clean Release Folder') {
+            steps {
+                powershell '''
+                    Write-Host "Cleaning release folder: $env:ReleaseFolder"
+                    if (Test-Path $env:ReleaseFolder) {
+                        $files = Get-ChildItem -Path $env:ReleaseFolder | Sort-Object LastWriteTime -Descending
+                        $old = $files | Select-Object -Skip $env:Files_To_Keep
+                        $old | ForEach-Object {
+                            Write-Host "Deleting: $($_.FullName)"
+                            Remove-Item -Force -Recurse $_.FullName
+                        }
+                    }
+                '''
+            }
+        }
+
+        stage('Package Release') {
+            steps {
+                script {
+                    def fileName = "${env.ReleaseFileName}-${env.Version}-${env.BUILD_NUMBER}.7z"
+                    powershell """
+                        \$fileName = "${fileName}"
+                        \$distPath = "${env.uiProjectName}/dist"
+                        if (!(Test-Path \$env:ReleaseFolder)) {
+                            New-Item -ItemType Directory -Path \$env:ReleaseFolder -Force
+                        }
+                        Set-Location \$distPath
+                        & "C:/Program Files/7-Zip/7z.exe" a -t7z -mx=9 -m0=LZMA2 -ms=1g -r "\$env:ReleaseFolder/\$fileName" *
+                        if (\$LASTEXITCODE -ne 0) {
+                            exit \$LASTEXITCODE
+                        }
+                    """
+                }
+            }
+        }
+        stage('Execute Deployment Script') {
+            steps {
+                script {
+                    try {
+                        def command = "& '${env.scriptPath}' -Version '${env.Version}' -Build '${env.BUILD_NUMBER}'"
+                        def powershellOutput = powershell(
+                            script: command,
+                            returnStatus: true
+                        )
+                        if (powershellOutput != 0)
+                        {
+                            echo "powershell script executed with non-zero status :  ${powershellOutput}"
+                            currentBuild.status = 'FAILURE'
+                        }
+                    }
+                    catch (err)
+                    {
+                        error "occured while running the powershell script: ${err}"
+                        currentBuild.status = 'FAILURE'
+                    }
+                    
+                }
+            }
+        }
     }
 }
-
-Write-Host "`nDeleting resource group and all resources..." -ForegroundColor Yellow
-az group delete --name $resourceGroup --yes --no-wait
-
-Write-Host "✓ Deletion initiated. Resources will be removed in background." -ForegroundColor Green
-Write-Host "✓ Check Azure Portal for deletion progress.`n" -ForegroundColor Green
